@@ -8,6 +8,7 @@
 #
 # Использование:
 #   tests/sandbox.sh links <url|файл>...   проверить каждый ключ по отдельности
+#                                          (после той же чистки, что в update.sh)
 #   tests/sandbox.sh run <url|ключ>...     прогнать update.sh целиком (до 3 источников)
 #   tests/sandbox.sh podkop <url|файл>     скормить ВСЕ ключи «Podkop» без фильтра,
 #                                          как будто их вписали руками
@@ -18,6 +19,7 @@
 #   SINGBOX_BIN     свой бинарник sing-box вместо скачивания (например, extended)
 #   LIMIT           сколько ключей отбирает update.sh (по умолчанию как в скрипте)
 #   BREAK_RESTART=1 первый рестарт «падает», чтобы проверить откат
+#   BREAK_UCI=1     uci commit завершается ошибкой, чтобы проверить защиту записи
 #   SEED_LINKS      файл с ключами, которые уже «стоят» в Podkop до запуска run
 #   SANDBOX_SHELL   чем запускать update.sh (по умолчанию sh)
 #   SANDBOX_CACHE   куда складывать скачанное (по умолчанию .sandbox/ в репозитории)
@@ -111,15 +113,17 @@ case "$cmd" in
     set) drop "$key"; printf '%s=%s\n' "$key" "$val" >> "$store" ;;
     add_list) printf '%s=%s\n' "$key" "$val" >> "$store" ;;
     delete) drop "$key" ;;
-    commit) ;;
+    commit) [ "${BREAK_UCI:-}" = 1 ] && { echo "uci: I/O error" >&2; exit 1; }; : ;;
+    revert) ;;
     *) echo "uci-заглушка: не умею '$cmd'" >&2; exit 1 ;;
 esac
 EOF
 
 # pidof: sing-box «запущен», если последний рестарт прошёл
+# pidof: «pid» запущенного sing-box — номер рестарта, после которого он поднялся
 cat > "$BIN/pidof" <<EOF
 #!/bin/sh
-[ -e "$RUN/running" ]
+[ -e "$RUN/running" ] && cat "$RUN/running"
 EOF
 
 # wget через curl; локальный файл отдаётся как есть, чтобы run принимал фикстуры
@@ -173,7 +177,9 @@ for link in \$links; do
 done
 printf '%s' "\$config" > "$RUN/sing-box.json"
 if result=\$(sing-box check -c "$RUN/sing-box.json" 2>&1); then
-    touch "$RUN/running"
+    n=\$(cat "$RUN/restarts" 2>/dev/null || echo 0)
+    echo \$((n + 1)) > "$RUN/restarts"
+    echo \$((n + 1)) > "$RUN/running"
     echo "   [podkop] sing-box запущен, ключей: \$((i - 1))" >&2
 else
     echo "   [podkop] Sing-box configuration is invalid. Aborted." >&2
@@ -192,6 +198,7 @@ extract_links() {
     . "$RUN/funcs.sh"
     PATTERN=$(sed -n "s/^PATTERN=//p" "$ROOT/update.sh")
     eval "PATTERN=$PATTERN"
+    eval "$(grep '^DEFAULT_FP=' "$ROOT/update.sh")"
     for src in "$@"; do
         if [ -f "$src" ]; then cat "$src"; else download_content "$src"; fi
     done | find_links | awk '!seen[$0]++'
@@ -205,8 +212,15 @@ case "$mode" in
     links)
         extract_links "$@" > "$RUN/links"
         ok=0; bad=0
-        while IFS= read -r link <&3; do
-            title=$(printf '%s' "$link" | sed 's/.*#//' | cut -c1-40)
+        while IFS= read -r raw <&3; do
+            title=$(printf '%s' "$raw" | sed 's/.*#//' | cut -c1-40)
+            # как в update.sh: сначала чистка, проверяется уже очищенная ссылка
+            link=$(normalize_link "$raw") || {
+                bad=$((bad + 1))
+                echo "❌ $title"
+                echo "     отброшен при чистке (неподдерживаемая схема, обрезанная ссылка или пробел внутри)"
+                continue
+            }
             printf '%s\n' "$link" | sed 's/^/podkop.main.urltest_proxy_links=/' > "$CONFIG"
             if podkop-restart 2>"$RUN/err" && [ -e "$RUN/running" ]; then
                 ok=$((ok + 1))

@@ -153,9 +153,10 @@ normalize_link() {
     esac
 
     # Без type Podkop собирает обычный tcp, но пишет в лог красное
-    # "Unknown transport ''". Указываем tcp явно
+    # "Unknown transport ''". Указываем tcp явно (пустой type= — тоже без type)
     case "$base" in
         vless://*|trojan://*)
+            base=$(printf '%s' "$base" | sed -E 's/([?&])type=(&|$)/\1/; s/[?&]$//')
             case "$base" in
                 *[?\&]type=?*) ;;
                 *\?*) base="${base}&type=tcp" ;;
@@ -338,7 +339,7 @@ validate_file() {
 # и через его Clash API меряет задержку каждого до TEST_URL.
 # Живые пишет в $2 как "id<TAB>задержка". Podkop при этом не трогается.
 ping_outbounds() {
-    url=$(printf '%s' "$TEST_URL" | sed 's#:#%3A#g; s#/#%2F#g')
+    url=$(printf '%s' "$TEST_URL" | jq -sRr @uri)
     cut -f2- "$1" | jq -sc --arg api "$PING_API" \
         '{log: {disabled: true}, experimental: {clash_api: {external_controller: $api}}, outbounds: .}' \
         > "$WORK/ping.json" || return 1
@@ -390,13 +391,24 @@ stop_ping() {
 }
 
 # --- ПРИМЕНЕНИЕ ---
+# Процессы sing-box, которых не было до рестарта (список $OLD_PIDS)
+new_singbox() {
+    for p in $(pidof sing-box 2>/dev/null); do
+        case " $OLD_PIDS " in
+            *" $p "*) ;;
+            *) printf '%s ' "$p" ;;
+        esac
+    done
+}
+
+# Ждёт, что после рестарта поднялся новый sing-box и остался жив.
+# Старый процесс, переживший рестарт, или чужой sing-box не считаются
 singbox_is_up() {
     elapsed=0
     while [ "$elapsed" -lt "$RESTART_TIMEOUT" ]; do
-        if pidof sing-box >/dev/null 2>&1; then
-            # sing-box должен не просто стартовать, а остаться жив
+        if [ -n "$(new_singbox)" ]; then
             sleep 5
-            pidof sing-box >/dev/null 2>&1 && return 0
+            [ -n "$(new_singbox)" ] && return 0
         fi
         sleep 3
         elapsed=$((elapsed + 3))
@@ -549,23 +561,33 @@ cp "$PODKOP_CONFIG" "$WORK/podkop.backup" || {
     exit 1
 }
 
-uci -q delete "podkop.$SECTION.urltest_proxy_links"
-log "🧹 Старые ключи удалены из конфига"
-
 log "⚙️  Настройка Podkop: включение URLTest и запись ключей..."
-uci set "podkop.$SECTION.connection_type=proxy"
-uci set "podkop.$SECTION.proxy_config_type=urltest"
-uci set "podkop.$SECTION.urltest_check_interval=1m"
-uci set "podkop.$SECTION.urltest_tolerance=150"
-uci set "podkop.$SECTION.urltest_testing_url=$TEST_URL"
+write_config() {
+    uci -q delete "podkop.$SECTION.urltest_proxy_links"
+    uci set "podkop.$SECTION.connection_type=proxy" &&
+    uci set "podkop.$SECTION.proxy_config_type=urltest" &&
+    uci set "podkop.$SECTION.urltest_check_interval=1m" &&
+    uci set "podkop.$SECTION.urltest_tolerance=150" &&
+    uci set "podkop.$SECTION.urltest_testing_url=$TEST_URL" || return 1
 
-while read -r link; do
-    [ -n "$link" ] && uci add_list "podkop.$SECTION.urltest_proxy_links=$link"
-done < "$WORK/final"
+    while read -r link; do
+        [ -n "$link" ] || continue
+        uci add_list "podkop.$SECTION.urltest_proxy_links=$link" || return 1
+    done < "$WORK/final"
 
-uci commit podkop
+    uci commit podkop
+}
+
+if ! write_config; then
+    # Ничего не перезапускаем: возвращаем конфиг как был
+    uci -q revert podkop
+    cp "$WORK/podkop.backup" "$PODKOP_CONFIG"
+    log "❌ Не удалось записать конфиг Podkop (uci) — возвращён прежний, Podkop не перезапускался"
+    exit 1
+fi
 
 log "🔄 Перезапуск сервиса..."
+OLD_PIDS=" $(pidof sing-box 2>/dev/null) "
 /etc/init.d/podkop restart
 
 if singbox_is_up; then
@@ -577,6 +599,7 @@ fi
 log "💥 sing-box не запустился за ${RESTART_TIMEOUT}с — возвращаю прежний конфиг"
 log "   Подробности: logread -e podkop | tail -n 30"
 cp "$WORK/podkop.backup" "$PODKOP_CONFIG"
+OLD_PIDS=" $(pidof sing-box 2>/dev/null) "
 /etc/init.d/podkop restart
 
 if singbox_is_up; then
