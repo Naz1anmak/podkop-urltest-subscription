@@ -3,25 +3,57 @@
 # --- НАСТРОЙКИ ---
 # Здесь можно указать:
 # - raw-ссылки на подписки
-# - прямые ссылки вида vless://, ss://, trojan://, socks://, hy2://
+# - прямые ссылки вида vless://, ss://, trojan://, socks5://, hy2://
 SOURCE_1=""
 SOURCE_2=""
 SOURCE_3=""
 
 # Сколько максимум ключей класть в Podkop
 LIMIT=27
+
+# Секция Podkop, в которую пишутся ключи
+SECTION="main"
+
+# Проверять, что серверы живые (пинг через временный sing-box): 1 — да, 0 — нет
+PING_CHECK=1
+
+# Серверы с задержкой больше этой (мс) при пинге отбрасываются
+MAX_DELAY=2000
+
+# uTLS-отпечаток для reality-ключей, где fp не указан
+DEFAULT_FP="firefox"
+
+# Адрес для пинга и для URLTest в Podkop
+TEST_URL="https://www.gstatic.com/generate_204"
+
+# Сколько секунд ждать запуска sing-box после рестарта Podkop
+RESTART_TIMEOUT=120
 # -----------------
+
+# Где лежат библиотеки Podkop (переопределяется только для тестов)
+PODKOP_LIB="${PODKOP_LIB:-/usr/lib/podkop}"
+PODKOP_CONFIG="${PODKOP_CONFIG:-/etc/config/podkop}"
 
 log() { echo "[$(date '+%F %T')] $*" >&2; }
 
-TMP_PRIORITY="$(mktemp)"
-TMP_POOL="$(mktemp)"
-TMP_FINAL="$(mktemp)"
+WORK="$(mktemp -d)" || exit 1
+PING_PID=""
+trap '[ -n "$PING_PID" ] && kill "$PING_PID" 2>/dev/null; rm -rf "$WORK"' EXIT INT TERM
 
-trap 'rm -f "$TMP_PRIORITY" "$TMP_POOL" "$TMP_FINAL" "${TMP_POOL}.rnd" "${TMP_PRIORITY}.u" "${TMP_POOL}.u"' EXIT INT TERM
+# Порт временного Clash API для пинга
+PING_API="127.0.0.1:19090"
 
-# Ищем в тексте ссылки на поддерживаемые протоколы
-PATTERN='(vless|ss|trojan|socks|hy2)://[^"'"'"' <]+'
+TAB="$(printf '\t')"
+ESC="$(printf '\033')"
+
+# Ищем в тексте ссылки на поддерживаемые протоколы. Схема должна стоять
+# отдельно: иначе в vmess://... найдётся "ss://..." (см. find_links)
+PATTERN='(^|[^a-z0-9])(vless|ss|trojan|socks|socks4|socks4a|socks5|hysteria2|hy2)://[^"'"'"' <>]+'
+
+# Достаёт ссылки из текста и срезает захваченный символ перед схемой
+find_links() {
+    grep -oE "$PATTERN" | sed -E 's#^[^a-z0-9]##'
+}
 
 # --- НОРМАЛИЗАЦИЯ ИМЕНИ ---
 # Убираем мусор из названия, но флаги и emoji не трогаем
@@ -32,43 +64,68 @@ clean_name() {
     sed 's/["\\`]/_/g' | \
     sed 's/[?#&]/_/g' | \
     sed 's/[|,]/_/g' | \
-    sed 's/[[:space:]]\+/_/g'
-}
-
-is_valid_fp() {
-    case "$1" in
-        chrome|firefox|safari|ios|android|edge|360|random) return 0 ;;
-        *) return 1 ;;
-    esac
+    sed 's/[[:space:]][[:space:]]*/_/g'
 }
 
 # --- СКАЧИВАНИЕ ---
-# Загружает сырой текст/HTML/подписку
+# Загружает сырой текст/HTML/подписку и при необходимости декодирует base64
 download_content() {
     raw=$(wget --no-check-certificate --user-agent="v2rayNG/1.8.5" -qO- "$1" 2>/dev/null)
     [ -n "$raw" ] || return 1
 
-    # Если контент base64 — декодируем, иначе возвращаем как есть
-    printf '%s' "$raw" | base64 -d 2>/dev/null || printf '%s' "$raw"
+    # Ссылки уже видны — это текст или HTML
+    case "$raw" in
+        *://*) printf '%s' "$raw"; return 0 ;;
+    esac
+
+    # Иначе пробуем base64 (в т.ч. url-safe и без паддинга)
+    b64=$(printf '%s' "$raw" | tr -d ' \r\n' | tr '_-' '/+')
+    case $((${#b64} % 4)) in
+        2) b64="${b64}==" ;;
+        3) b64="${b64}=" ;;
+    esac
+    decoded=$(printf '%s' "$b64" | base64 -d 2>/dev/null)
+    case "$decoded" in
+        *://*) printf '%s' "$decoded" ;;
+        *) printf '%s' "$raw" ;;
+    esac
+}
+
+# socks:// (формат v2rayN) Podkop не понимает — переводим в socks5://
+fix_socks() {
+    rest="${1#socks://}"
+    case "$rest" in
+        *@*)
+            userinfo="${rest%%@*}"
+            case "$userinfo" in
+                *:*) ;;
+                *)
+                    decoded=$(printf '%s' "$userinfo" | base64 -d 2>/dev/null)
+                    case "$decoded" in
+                        *:*) userinfo="$decoded" ;;
+                    esac
+                    ;;
+            esac
+            printf 'socks5://%s@%s' "$userinfo" "${rest#*@}"
+            ;;
+        *) printf 'socks5://%s' "$rest" ;;
+    esac
 }
 
 # --- НОРМАЛИЗАЦИЯ ССЫЛКИ ---
-# Приводит ссылку к виду, который понимает Podkop/sing-box
+# Только чистка мусора. Параметры ключа не трогаем:
+# годен ли ключ, решает sing-box (см. ПРОВЕРКА)
 normalize_link() {
-    raw="$1"
-
     # Убираем мусор, чистим HTML-экранирование и пробелы по краям
-    link=$(printf '%s' "$raw" | tr -cd '\11\12\15\40-\176' | \
+    link=$(printf '%s' "$1" | tr -cd '\40-\176' | \
        sed 's/&amp;/\&/g; s/^[[:space:]]*//; s/[[:space:]]*$//')
 
-    # Выкидываем обрезанные ключи (заканчиваются на & или =)
     case "$link" in
-        *'='|*'&') return 1 ;;
+        socks://*) link=$(fix_socks "$link") ;;
     esac
 
-    # Принимаем только поддерживаемые схемы
     case "$link" in
-        vless://*|ss://*|trojan://*|socks://*|hy2://*) ;;
+        vless://*|ss://*|trojan://*|socks4://*|socks4a://*|socks5://*|hysteria2://*|hy2://*) ;;
         *) return 1 ;;
     esac
 
@@ -77,118 +134,71 @@ normalize_link() {
     name=""
     [ "$base" != "$link" ] && name="${link#*#}"
 
-    # Неподдерживаемый транспорт сразу выкидываем
-    printf '%s' "$base" | grep -qi 'type=xhttp' && return 1
-
-    # Shadowsocks почти не трогаем: только имя при необходимости
-    if printf '%s' "$base" | grep -q 'ss://'; then
-        if [ -n "$name" ]; then
-            printf '%s#%s\n' "$base" "$(clean_name "$name")"
-        else
-            printf '%s\n' "$base"
-        fi
-        return 0
-    fi
-
-    # Если query отсутствует, добавляем его для дальнейшей сборки
+    # Выкидываем обрезанные ключи (query заканчивается на & или =)
     case "$base" in
-        *\?*) ;;
-        *) base="${base}?" ;;
+        *\?*=|*\?*'&') return 1 ;;
     esac
 
-    # Разбираем query заново:
-    # убираем security/type и пустые параметры, чтобы не тащить мусор дальше
-    path="${base%%\?*}"
-    query=""
-    if [ "$path" != "$base" ]; then
-        query="${base#*\?}"
-    fi
-
-    # если есть пустые значения — выкидываем
-    printf '%s' "$query" | grep -qE '(^|&)security=(&|$)' && return 1
-    printf '%s' "$query" | grep -qE '(^|&)type=httpupgrade(&|$|#)' && return 1
-    printf '%s' "$query" | grep -qE '(^|&)fp=(&|$)' && return 1
-
-    query=$(printf '%s' "$query" | sed 's/^&//; s/&&*/\&/g')
-
-    query_clean=""
-    old_ifs=$IFS
-    IFS='&'
-    for pair in $query; do
-        [ -n "$pair" ] || continue
-
-        key=${pair%%=*}
-        val=""
-        case "$pair" in
-            *=*) val=${pair#*=} ;;
-        esac
-
-        [ -n "$key" ] || continue
-        [ "$key" = "security" ] && continue
-        [ "$key" = "type" ] && continue
-        [ -n "$val" ] || continue
-
-        if [ -n "$query_clean" ]; then
-            query_clean="${query_clean}&${pair}"
-        else
-            query_clean="$pair"
-        fi
-    done
-    IFS=$old_ifs
-
-    if [ -n "$query_clean" ]; then
-        base="${path}?${query_clean}"
-    else
-        base="${path}?"
-    fi
-
-    # SECURITY
-    # Reality определяем по наличию pbk
-    if printf '%s' "$base" | grep -q 'pbk='; then
-        security="reality"
-    else
-        # Для остальных типов выбираем по порту
-        port=$(printf '%s' "$base" | sed -nE 's#.*:([0-9]+).*#\1#p')
-        case "$port" in
-            443|8443|2053|2083|2096|2087) security="tls" ;;
-            *) security="none" ;;
-        esac
-    fi
-
-    # TYPE
-    # Берём только нормальное значение, без хвостов и мусора
-    transport=$(printf '%s' "$query" | sed -nE 's/(^|&)type=([A-Za-z0-9]+).*/\2/p')
-    transport=$(printf '%s' "$transport" | tr -cd 'a-zA-Z0-9')
-
-    case "$transport" in
-        "") transport="tcp" ;;
-        tcp|ws|grpc) ;;
-        *) return 1 ;;
-    esac
-
+    # sing-box не пускает reality без uTLS, а многие подписки fp не пишут.
+    # Подставляем DEFAULT_FP, как это делают клиенты (и Forkop)
     case "$base" in
-        *\?*) ;;
-        *) base="${base}?" ;;
+        *[?\&]security=reality*)
+            # пустой fp= считаем отсутствующим
+            base=$(printf '%s' "$base" | sed -E 's/([?&])fp=(&|$)/\1/; s/[?&]$//')
+            case "$base" in
+                *[?\&]fp=?*) ;;
+                *) base="${base}&fp=$DEFAULT_FP" ;;
+            esac
+            ;;
     esac
 
-    # Собираем финальную ссылку
-    base="${base}&security=${security}&type=${transport}"
+    # Без type Podkop собирает обычный tcp, но пишет в лог красное
+    # "Unknown transport ''". Указываем tcp явно (пустой type= — тоже без type)
+    case "$base" in
+        vless://*|trojan://*)
+            base=$(printf '%s' "$base" | sed -E 's/([?&])type=(&|$)/\1/; s/[?&]$//')
+            case "$base" in
+                *[?\&]type=?*) ;;
+                *\?*) base="${base}&type=tcp" ;;
+                *) base="${base}?type=tcp" ;;
+            esac
+            ;;
+    esac
 
-    # Reality без fp лучше не пускать
-    if [ "$security" = "reality" ]; then
-        fp=$(printf '%s' "$base" | sed -nE 's/.*[?&]fp=([^&]+).*/\1/p')
-        [ -z "$fp" ] && return 1
-    fi
+    [ -n "$name" ] && base="${base}#$(clean_name "$name")"
 
-    # Чистим хвосты вида ?& / && / & в конце
-    res=$(printf '%s' "$base" | sed 's/?&/?/g; s/&&/\&/g; s/&$//; s/?$//')
+    # Podkop читает список ключей через for link in $list:
+    # пробел внутри ссылки разрежет её на куски и уронит запуск
+    case "$base" in
+        *[[:space:]]*) return 1 ;;
+    esac
 
-    # Возвращаем имя, если оно было
-    if [ -n "$name" ]; then
-        printf '%s#%s\n' "$res" "$(clean_name "$name")"
-    else
-        printf '%s\n' "$res"
-    fi
+    printf '%s\n' "$base"
+}
+
+# %F0%9F%87%B3 -> 🇳 и т.д.
+url_decode() {
+    printf '%b' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g')"
+}
+
+# Имя ключа для логов: то, что после #, иначе host:port
+link_title() {
+    case "$1" in
+        *#?*) url_decode "${1#*#}" ;;
+        *) printf '%s' "$1" | sed -E 's#^[a-z0-9]+://([^@]*@)?([^/?#]*).*#\2#' ;;
+    esac
+}
+
+# Частые технические причины — по-человечески
+human_reason() {
+    case "$1" in
+        *"cannot be parsed as a number"*) printf 'пустое числовое поле в ссылке (порт или другой параметр)' ;;
+        *"Expected JSON value"*|"") printf 'Podkop не смог разобрать ссылку' ;;
+        *"xhttp transport is not supported"*) printf 'xhttp не поддерживается установленным sing-box (нужен podkop-engine)' ;;
+        *"server_port"*"uint16"*) printf 'неверный порт' ;;
+        *"panic:"*) printf 'sing-box падает на этой ссылке (%s)' "$1" ;;
+        *) printf '%s' "$1" ;;
+    esac
 }
 
 # --- СБОР ---
@@ -198,116 +208,403 @@ collect() {
     input="$1"
     num="$2"
 
+    [ -n "$input" ] || return
+
     case "$input" in
-        vless://*|ss://*|trojan://*|socks://*|hy2://*)
-            norm=$(normalize_link "$input") || {
-                log "⚠️  Ссылка $num: прямой ключ отброшен"
-                return
-            }
-            log "✅ Ссылка $num: добавлен прямой ключ (приоритет)"
-            printf '%s\n' "$norm" >> "$TMP_PRIORITY"
-            ;;
-
-        *)
-            log "📡 Ссылка $num: загрузка..."
-            content=$(download_content "$input") || {
-                log "❌ Ссылка $num: ошибка загрузки"
-                return
-            }
-
-            # Считаем найденные ключи до фильтрации
-            count=$(printf '%s\n' "$content" | grep -oE "$PATTERN" | wc -l | tr -d ' ')
-            log "✅ Ссылка $num: найдено ключей: $count"
-
-            # Парсим каждый найденный ключ отдельно
-            printf '%s\n' "$content" | grep -oE "$PATTERN" | while read -r link; do
-                norm=$(normalize_link "$link") || continue
-                printf '%s\n' "$norm" >> "$TMP_POOL"
-            done
+        *://*)
+            case "$input" in
+                http://*|https://*) ;;
+                *)
+                    norm=$(normalize_link "$input") || {
+                        log "⚠️  Ссылка $num: прямой ключ отброшен"
+                        return
+                    }
+                    log "✅ Ссылка $num: добавлен прямой ключ (приоритет)"
+                    printf '%s\n' "$norm" >> "$WORK/priority"
+                    return
+                    ;;
+            esac
             ;;
     esac
+
+    log "📡 Ссылка $num: загрузка..."
+    content=$(download_content "$input") || {
+        log "❌ Ссылка $num: ошибка загрузки"
+        return
+    }
+
+    # Считаем найденные ключи до фильтрации
+    count=$(printf '%s\n' "$content" | find_links | wc -l | tr -d ' ')
+    log "✅ Ссылка $num: найдено ключей: $count"
+
+    printf '%s\n' "$content" | find_links | while read -r link; do
+        norm=$(normalize_link "$link") || continue
+        printf '%s\n' "$norm" >> "$WORK/pool"
+    done
 }
 
-# --- СТАРТ ---
+# --- ПРОВЕРКА ---
+# Каждый ключ превращается в outbound тем же кодом Podkop, который потом
+# соберёт итоговый конфиг, и проверяется установленным sing-box.
+
+validation_available() {
+    command -v sing-box >/dev/null 2>&1 || { log "⚠️  sing-box не найден"; return 1; }
+    command -v jq >/dev/null 2>&1 || { log "⚠️  jq не найден"; return 1; }
+    [ -r "$PODKOP_LIB/sing_box_config_facade.sh" ] || {
+        log "⚠️  Не найдены библиотеки Podkop в $PODKOP_LIB"
+        return 1
+    }
+    (
+        . "$PODKOP_LIB/constants.sh"
+        . "$PODKOP_LIB/sing_box_config_facade.sh"
+        command -v sing_box_cf_add_proxy_outbound >/dev/null 2>&1
+    ) 2>/dev/null || {
+        log "⚠️  В этой версии Podkop нет sing_box_cf_add_proxy_outbound"
+        return 1
+    }
+}
+
+# Строит outbound для каждой строки "id<TAB>ссылка" из $1.
+# Удачные пишет в $2 как "id<TAB>json", неудачные в $3 как "id<TAB>причина"
+build_outbounds() {
+    (
+        . "$PODKOP_LIB/constants.sh"
+        [ -r "$PODKOP_LIB/logging.sh" ] && . "$PODKOP_LIB/logging.sh"
+        . "$PODKOP_LIB/sing_box_config_facade.sh"
+        # Podkop пишет ошибки через log ... "fatal" — перехватываем их как причину
+        log() { [ "$2" = "fatal" ] && printf '%s\n' "$1" >&2; return 0; }
+
+        while IFS="$TAB" read -r id link <&3; do
+            out=$(sing_box_cf_add_proxy_outbound '{"outbounds":[]}' "pu$id" "$link" "$UDP_OVER_TCP" 2>"$WORK/build.err")
+            outbound=$(printf '%s' "$out" | jq -ce '.outbounds[0] // empty' 2>/dev/null)
+            if [ -n "$outbound" ]; then
+                printf '%s\t%s\n' "$id" "$outbound" >> "$2"
+            else
+                reason=$(head -n 1 "$WORK/build.err")
+                printf '%s\t%s\n' "$id" "${reason:-Podkop не смог разобрать ссылку}" >> "$3"
+            fi
+        done 3< "$1"
+    )
+}
+
+# Проверяет набор outbound'ов (файл "id<TAB>json") одним sing-box check
+check_outbounds() {
+    cut -f2- "$1" | jq -sc '{log: {disabled: true}, outbounds: .}' > "$WORK/check.json" 2>/dev/null || {
+        CHECK_ERR="не удалось собрать JSON"
+        return 1
+    }
+    CHECK_ERR=$(sing-box check -c "$WORK/check.json" 2>&1) && return 0
+    CHECK_ERR=$(printf '%s\n' "$CHECK_ERR" | sed "s/${ESC}\[[0-9;]*m//g" | \
+        grep -m 1 -iE 'fatal|panic|error' | \
+        sed 's/^.*FATAL\[[0-9]*\] //; s/^initialize outbound\[[0-9]*\]: //; s/^decode config at [^:]*: //')
+    return 1
+}
+
+# Деление пополам: чистый набор стоит одну проверку, плохие ключи
+# изолируются рекурсивно (группы до 4 штук проверяются по одному)
+PART=0
+validate_file() {
+    local file="$1" n size i part
+    n=$(wc -l < "$file" | tr -d ' ')
+    [ "$n" -gt 0 ] || return 0
+
+    if check_outbounds "$file"; then
+        cat "$file" >> "$WORK/good"
+        return 0
+    fi
+
+    if [ "$n" -eq 1 ]; then
+        printf '%s\t%s\n' "$(cut -f1 "$file")" "${CHECK_ERR:-sing-box check не прошёл}" >> "$WORK/rejected"
+        return 0
+    fi
+
+    if [ "$n" -le 4 ]; then
+        size=1
+    else
+        size=$(( (n + 1) / 2 ))
+    fi
+
+    i=1
+    while [ "$i" -le "$n" ]; do
+        PART=$((PART + 1))
+        part="$WORK/part.$PART"
+        sed -n "${i},$((i + size - 1))p" "$file" > "$part"
+        validate_file "$part"
+        i=$((i + size))
+    done
+}
+
+# --- ПИНГ ---
+# Поднимает временный sing-box только с outbound'ами из $1 ("id<TAB>json")
+# и через его Clash API меряет задержку каждого до TEST_URL.
+# Живые пишет в $2 как "id<TAB>задержка". Podkop при этом не трогается.
+ping_outbounds() {
+    url=$(printf '%s' "$TEST_URL" | jq -sRr @uri)
+    cut -f2- "$1" | jq -sc --arg api "$PING_API" \
+        '{log: {disabled: true}, experimental: {clash_api: {external_controller: $api}}, outbounds: .}' \
+        > "$WORK/ping.json" || return 1
+
+    sing-box run -c "$WORK/ping.json" >/dev/null 2>&1 &
+    PING_PID=$!
+
+    tries=0
+    until wget -q -O /dev/null "http://$PING_API/version" 2>/dev/null; do
+        tries=$((tries + 1))
+        if [ "$tries" -gt 20 ] || ! kill -0 "$PING_PID" 2>/dev/null; then
+            stop_ping
+            return 1
+        fi
+        sleep 1
+    done
+
+    # Замеряем пачками по 20 параллельно
+    : > "$2"
+    pids=""
+    n=0
+    while IFS="$TAB" read -r id json <&3; do
+        tag=$(printf '%s' "$json" | jq -r '.tag')
+        (
+            r=$(wget -T $((MAX_DELAY / 1000 + 3)) -q -O - \
+                "http://$PING_API/proxies/$tag/delay?url=$url&timeout=$MAX_DELAY" 2>/dev/null)
+            delay=$(printf '%s' "$r" | sed -n 's/.*"delay":\([0-9][0-9]*\).*/\1/p')
+            [ -n "$delay" ] && printf '%s\t%s\n' "$id" "$delay" >> "$2"
+        ) &
+        pids="$pids $!"
+        n=$((n + 1))
+        if [ "$n" -ge 20 ]; then
+            wait $pids
+            pids=""
+            n=0
+        fi
+    done 3< "$1"
+    [ -n "$pids" ] && wait $pids
+
+    stop_ping
+    return 0
+}
+
+stop_ping() {
+    [ -n "$PING_PID" ] || return 0
+    kill "$PING_PID" 2>/dev/null
+    wait "$PING_PID" 2>/dev/null
+    PING_PID=""
+}
+
+# --- ПРИМЕНЕНИЕ ---
+# Процессы sing-box, которых не было до рестарта (список $OLD_PIDS)
+new_singbox() {
+    for p in $(pidof sing-box 2>/dev/null); do
+        case " $OLD_PIDS " in
+            *" $p "*) ;;
+            *) printf '%s ' "$p" ;;
+        esac
+    done
+}
+
+# Ждёт, что после рестарта поднялся новый sing-box и остался жив.
+# Старый процесс, переживший рестарт, или чужой sing-box не считаются
+singbox_is_up() {
+    elapsed=0
+    while [ "$elapsed" -lt "$RESTART_TIMEOUT" ]; do
+        if [ -n "$(new_singbox)" ]; then
+            sleep 5
+            [ -n "$(new_singbox)" ] && return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    return 1
+}
+
+# ==================== СТАРТ ====================
+: > "$WORK/priority"
+: > "$WORK/pool"
+
 log "📥 Сбор ключей..."
 collect "$SOURCE_1" "1"
 collect "$SOURCE_2" "2"
 collect "$SOURCE_3" "3"
 
-log "🔍 Фильтрация, исправление и выборка $LIMIT случайных ключей..."
+# Кандидаты: сначала прямые ключи, затем пул в случайном порядке, без дублей
+sort -u "$WORK/pool" | awk 'BEGIN{srand()} {print rand() "\t" $0}' | sort -n | cut -f2- > "$WORK/pool.rnd"
+cat "$WORK/priority" "$WORK/pool.rnd" | awk 'NF && !seen[$0]++' > "$WORK/candidates"
+CANDIDATES=$(wc -l < "$WORK/candidates" | tr -d ' ')
+PRIORITY_COUNT=$(awk 'NF' "$WORK/priority" | sort -u | wc -l | tr -d ' ')
 
-# Убираем дубли в приоритете и в пуле
-sort -u "$TMP_PRIORITY" > "${TMP_PRIORITY}.u" && mv "${TMP_PRIORITY}.u" "$TMP_PRIORITY"
-sort -u "$TMP_POOL" > "${TMP_POOL}.u" && mv "${TMP_POOL}.u" "$TMP_POOL"
-
-# Рандомизируем только пул
-if [ -s "$TMP_POOL" ]; then
-    awk 'BEGIN{srand()} {print rand() "\t" $0}' "$TMP_POOL" | sort -n | cut -f2- > "${TMP_POOL}.rnd"
-else
-    : > "${TMP_POOL}.rnd"
-fi
-
-# Сначала добавляем приоритетные прямые ключи
-cat "$TMP_PRIORITY" > "$TMP_FINAL"
-
-# Потом добираем случайными из пула до LIMIT
-while read -r link; do
-    [ -z "$link" ] && continue
-
-    count=$(wc -l < "$TMP_FINAL" | tr -d ' ')
-    [ "$count" -ge "$LIMIT" ] && break
-
-    grep -Fxq "$link" "$TMP_FINAL" && continue
-    printf '%s\n' "$link" >> "$TMP_FINAL"
-done < "${TMP_POOL}.rnd"
-
-TOTAL=$(wc -l < "$TMP_FINAL" | tr -d ' ')
-
-# Если ничего не осталось — ничего не меняем
-if [ "$TOTAL" -eq 0 ]; then
-    log "❌ Нет рабочих ключей — ничего не меняем"
+if [ "$CANDIDATES" -eq 0 ]; then
+    log "❌ Нет ключей — ничего не меняем"
     exit 0
 fi
 
-log "✨ Готово! Выбрано $TOTAL качественных серверов"
+: > "$WORK/good"
+: > "$WORK/rejected"
+
+if validation_available; then
+    UDP_OVER_TCP=$(uci -q get "podkop.$SECTION.enable_udp_over_tcp")
+    PINGING=0
+    [ "$PING_CHECK" = "1" ] && PINGING=1
+    log "🔍 Проверка ключей через Podkop + sing-box (кандидатов: $CANDIDATES, нужно: $LIMIT)..."
+    [ "$PINGING" = "1" ] && log "📶 Пинг через $TEST_URL, отбрасываем медленнее ${MAX_DELAY} мс"
+
+    # Кандидаты идут порциями: проверка sing-box, затем пинг новых.
+    # С пингом проверяются все кандидаты — иначе самый быстрый сервер
+    # из конца списка не попадёт в выборку. Без пинга хватает LIMIT рабочих
+    : > "$WORK/alive"
+    pos=1
+    while [ "$pos" -le "$CANDIDATES" ]; do
+        if [ "$PINGING" = "1" ]; then
+            chunk=100
+        else
+            chunk=$((LIMIT - $(wc -l < "$WORK/good")))
+            [ "$chunk" -gt 0 ] || break
+        fi
+
+        before=$(wc -l < "$WORK/good" | tr -d ' ')
+        awk -v a="$pos" -v b="$((pos + chunk - 1))" 'NR >= a && NR <= b {print NR "\t" $0}' \
+            "$WORK/candidates" > "$WORK/batch"
+        : > "$WORK/built"
+        build_outbounds "$WORK/batch" "$WORK/built" "$WORK/rejected"
+        validate_file "$WORK/built"
+        pos=$((pos + chunk))
+
+        if [ "$PINGING" = "1" ]; then
+            tail -n "+$((before + 1))" "$WORK/good" > "$WORK/good.new"
+            if [ -s "$WORK/good.new" ]; then
+                if ping_outbounds "$WORK/good.new" "$WORK/alive.new"; then
+                    cat "$WORK/alive.new" >> "$WORK/alive"
+                else
+                    log "⚠️  Не удалось запустить пинг — дальше без учёта пинга"
+                    PINGING=0
+                fi
+            fi
+            done_n=$((pos - 1)); [ "$done_n" -le "$CANDIDATES" ] || done_n=$CANDIDATES
+            [ "$PINGING" = "1" ] && log "📶 Проверено $done_n из $CANDIDATES: рабочих $(wc -l < "$WORK/good" | tr -d ' '), отвечают $(wc -l < "$WORK/alive" | tr -d ' ')"
+        fi
+    done
+
+    # Пишем в лог, что и почему отброшено
+    sort -n "$WORK/rejected" | while IFS="$TAB" read -r id reason; do
+        link=$(sed -n "${id}p" "$WORK/candidates")
+        if [ "$id" -le "$PRIORITY_COUNT" ]; then
+            log "⚠️  Прямой ключ отброшен: $(link_title "$link") — $(human_reason "$reason")"
+        else
+            log "⛔ Отброшен: $(link_title "$link") — $(human_reason "$reason")"
+        fi
+    done
+
+    # Отбор: прямые ключи всегда, остальные — живые по возрастанию задержки
+    sort -n "$WORK/good" > "$WORK/good.sorted"
+    awk -F "$TAB" -v p="$PRIORITY_COUNT" '$1 <= p' "$WORK/good.sorted" > "$WORK/selected"
+    awk -F "$TAB" -v p="$PRIORITY_COUNT" '$1 > p' "$WORK/good.sorted" > "$WORK/rest"
+    SLOTS=$((LIMIT - $(wc -l < "$WORK/selected" | tr -d ' ')))
+    [ "$SLOTS" -gt 0 ] || SLOTS=0
+
+    if [ "$PINGING" = "1" ]; then
+        cut -f1 "$WORK/selected" | while read -r id; do
+            grep -q "^$id$TAB" "$WORK/alive" || \
+                log "⚠️  Прямой ключ не отвечает, но оставлен: $(link_title "$(sed -n "${id}p" "$WORK/candidates")")"
+        done
+
+        if [ -s "$WORK/rest" ] && ! awk -F "$TAB" -v p="$PRIORITY_COUNT" '$1 > p {f=1} END {exit !f}' "$WORK/alive"; then
+            # Скорее всего, нет интернета или подписки целиком мёртвые
+            log "❌ Ни один сервер из подписок не ответил за ${MAX_DELAY} мс — ничего не меняем"
+            exit 1
+        fi
+
+        # id живых по возрастанию задержки -> их outbound'ы
+        awk -F "$TAB" -v p="$PRIORITY_COUNT" '$1 > p' "$WORK/alive" | sort -t "$TAB" -k2,2n | \
+            head -n "$SLOTS" | cut -f1 | while read -r id; do
+                grep "^$id$TAB" "$WORK/rest"
+            done >> "$WORK/selected"
+    else
+        head -n "$SLOTS" "$WORK/rest" >> "$WORK/selected"
+    fi
+
+    # Финальная проверка всего набора вместе
+    if [ -s "$WORK/selected" ] && ! check_outbounds "$WORK/selected"; then
+        log "❌ Итоговый набор не прошёл sing-box check ($CHECK_ERR) — ничего не меняем"
+        exit 1
+    fi
+
+    cut -f1 "$WORK/selected" | sort -n | while read -r id; do
+        sed -n "${id}p" "$WORK/candidates"
+    done > "$WORK/final"
+else
+    log "⚠️  Проверка через sing-box недоступна — ключи пойдут без проверки, защищает только откат"
+    head -n "$LIMIT" "$WORK/candidates" > "$WORK/final"
+fi
+
+TOTAL=$(wc -l < "$WORK/final" | tr -d ' ')
+REJECTED=$(wc -l < "$WORK/rejected" | tr -d ' ')
+
+# Если ничего не осталось — ничего не меняем
+if [ "$TOTAL" -eq 0 ]; then
+    log "❌ Нет рабочих ключей (отброшено: $REJECTED) — ничего не меняем"
+    exit 0
+fi
+
+log "✨ Готово! Выбрано $TOTAL серверов (отброшено: $REJECTED)"
+
+# Если список не изменился — не перезапускаем
+# (порядок не важен — его всё равно перемешивает случайная выборка)
+OLD_LINKS=$(uci -q get "podkop.$SECTION.urltest_proxy_links" | tr ' ' '\n' | sort)
+NEW_LINKS=$(sort "$WORK/final")
+if [ "$OLD_LINKS" = "$NEW_LINKS" ]; then
+    log "👌 Список ключей не изменился — перезапуск не нужен"
+    exit 0
+fi
 
 # --- UCI ---
-# Сначала удаляем старые ключи
-uci -q delete podkop.main.urltest_proxy_links
-log "🧹 Старые ключи удалены из конфига"
+# Сохраняем рабочий конфиг для отката
+cp "$PODKOP_CONFIG" "$WORK/podkop.backup" || {
+    log "❌ Не удалось сохранить резервную копию $PODKOP_CONFIG — ничего не меняем"
+    exit 1
+}
 
-# Затем настраиваем Podkop
 log "⚙️  Настройка Podkop: включение URLTest и запись ключей..."
-uci set podkop.main.connection_type='proxy'
-uci set podkop.main.proxy_config_type='urltest'
-uci set podkop.main.urltest_check_interval='1m'
-uci set podkop.main.urltest_tolerance='150'
-uci set podkop.main.urltest_testing_url='https://cp.cloudflare.com/generate_204'
+write_config() {
+    uci -q delete "podkop.$SECTION.urltest_proxy_links"
+    uci set "podkop.$SECTION.connection_type=proxy" &&
+    uci set "podkop.$SECTION.proxy_config_type=urltest" &&
+    uci set "podkop.$SECTION.urltest_check_interval=1m" &&
+    uci set "podkop.$SECTION.urltest_tolerance=150" &&
+    uci set "podkop.$SECTION.urltest_testing_url=$TEST_URL" || return 1
 
-# Записываем список ключей в конфиг
-WRITTEN=0
-while read -r link; do
-    [ -n "$link" ] || continue
-    case "$link" in
-        *pbk=*)
-            fp=$(printf '%s' "$link" | sed -nE 's/.*[?&]fp=([^&]+).*/\1/p')
-            case "$fp" in
-                chrome|firefox|safari|ios|android|edge|360|random) ;;
-                *)
-                    log "⛔ Отброшен (fp='$fp'): $link"
-                    continue
-                    ;;
-            esac
-            ;;
-    esac
-    uci add_list podkop.main.urltest_proxy_links="$link"
-    WRITTEN=$((WRITTEN + 1))
-done < "$TMP_FINAL"
+    while read -r link; do
+        [ -n "$link" ] || continue
+        uci add_list "podkop.$SECTION.urltest_proxy_links=$link" || return 1
+    done < "$WORK/final"
 
-uci commit podkop
+    uci commit podkop
+}
 
-# Перезапускаем сервис
+if ! write_config; then
+    # Ничего не перезапускаем: возвращаем конфиг как был
+    uci -q revert podkop
+    cp "$WORK/podkop.backup" "$PODKOP_CONFIG"
+    log "❌ Не удалось записать конфиг Podkop (uci) — возвращён прежний, Podkop не перезапускался"
+    exit 1
+fi
+
 log "🔄 Перезапуск сервиса..."
+OLD_PIDS=" $(pidof sing-box 2>/dev/null) "
 /etc/init.d/podkop restart
 
-log "🚀 Обновление успешно завершено! Записано серверов: $WRITTEN"
+if singbox_is_up; then
+    log "🚀 Обновление успешно завершено! Записано серверов: $TOTAL"
+    exit 0
+fi
+
+# --- ОТКАТ ---
+log "💥 sing-box не запустился за ${RESTART_TIMEOUT}с — возвращаю прежний конфиг"
+log "   Подробности: logread -e podkop | tail -n 30"
+cp "$WORK/podkop.backup" "$PODKOP_CONFIG"
+OLD_PIDS=" $(pidof sing-box 2>/dev/null) "
+/etc/init.d/podkop restart
+
+if singbox_is_up; then
+    log "↩️  Откат выполнен, Podkop работает на прежних ключах"
+else
+    log "❌ После отката sing-box тоже не запустился — проверьте Podkop вручную"
+fi
+exit 1
