@@ -128,6 +128,18 @@ normalize_link() {
             ;;
     esac
 
+    # Без type Podkop собирает обычный tcp, но пишет в лог красное
+    # "Unknown transport ''". Указываем tcp явно
+    case "$base" in
+        vless://*|trojan://*)
+            case "$base" in
+                *[?\&]type=?*) ;;
+                *\?*) base="${base}&type=tcp" ;;
+                *) base="${base}?type=tcp" ;;
+            esac
+            ;;
+    esac
+
     [ -n "$name" ] && base="${base}#$(clean_name "$name")"
 
     # Podkop читает список ключей через for link in $list:
