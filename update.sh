@@ -356,7 +356,7 @@ ping_outbounds() {
         sleep 1
     done
 
-    # Замеряем пачками по 10 параллельно
+    # Замеряем пачками по 20 параллельно
     : > "$2"
     pids=""
     n=0
@@ -370,7 +370,7 @@ ping_outbounds() {
         ) &
         pids="$pids $!"
         n=$((n + 1))
-        if [ "$n" -ge 10 ]; then
+        if [ "$n" -ge 20 ]; then
             wait $pids
             pids=""
             n=0
@@ -429,23 +429,45 @@ fi
 
 if validation_available; then
     UDP_OVER_TCP=$(uci -q get "podkop.$SECTION.enable_udp_over_tcp")
-    # С пингом проверяем с запасом: часть серверов окажется мёртвой
-    WANT=$LIMIT
-    [ "$PING_CHECK" = "1" ] && WANT=$((LIMIT * 3))
+    PINGING=0
+    [ "$PING_CHECK" = "1" ] && PINGING=1
     log "🔍 Проверка ключей через Podkop + sing-box (кандидатов: $CANDIDATES, нужно: $LIMIT)..."
+    [ "$PINGING" = "1" ] && log "📶 Пинг через $TEST_URL, отбрасываем медленнее ${MAX_DELAY} мс"
 
-    # Берём кандидатов порциями, пока не наберём WANT рабочих
+    # Кандидаты идут порциями: проверка sing-box, затем пинг новых.
+    # С пингом проверяются все кандидаты — иначе самый быстрый сервер
+    # из конца списка не попадёт в выборку. Без пинга хватает LIMIT рабочих
+    : > "$WORK/alive"
     pos=1
-    accepted=0
-    while [ "$accepted" -lt "$WANT" ] && [ "$pos" -le "$CANDIDATES" ]; do
-        need=$((WANT - accepted))
-        awk -v a="$pos" -v b="$((pos + need - 1))" 'NR >= a && NR <= b {print NR "\t" $0}' \
+    while [ "$pos" -le "$CANDIDATES" ]; do
+        if [ "$PINGING" = "1" ]; then
+            chunk=100
+        else
+            chunk=$((LIMIT - $(wc -l < "$WORK/good")))
+            [ "$chunk" -gt 0 ] || break
+        fi
+
+        before=$(wc -l < "$WORK/good" | tr -d ' ')
+        awk -v a="$pos" -v b="$((pos + chunk - 1))" 'NR >= a && NR <= b {print NR "\t" $0}' \
             "$WORK/candidates" > "$WORK/batch"
         : > "$WORK/built"
         build_outbounds "$WORK/batch" "$WORK/built" "$WORK/rejected"
         validate_file "$WORK/built"
-        accepted=$(wc -l < "$WORK/good" | tr -d ' ')
-        pos=$((pos + need))
+        pos=$((pos + chunk))
+
+        if [ "$PINGING" = "1" ]; then
+            tail -n "+$((before + 1))" "$WORK/good" > "$WORK/good.new"
+            if [ -s "$WORK/good.new" ]; then
+                if ping_outbounds "$WORK/good.new" "$WORK/alive.new"; then
+                    cat "$WORK/alive.new" >> "$WORK/alive"
+                else
+                    log "⚠️  Не удалось запустить пинг — дальше без учёта пинга"
+                    PINGING=0
+                fi
+            fi
+            done_n=$((pos - 1)); [ "$done_n" -le "$CANDIDATES" ] || done_n=$CANDIDATES
+            [ "$PINGING" = "1" ] && log "📶 Проверено $done_n из $CANDIDATES: рабочих $(wc -l < "$WORK/good" | tr -d ' '), отвечают $(wc -l < "$WORK/alive" | tr -d ' ')"
+        fi
     done
 
     # Пишем в лог, что и почему отброшено
@@ -465,34 +487,26 @@ if validation_available; then
     SLOTS=$((LIMIT - $(wc -l < "$WORK/selected" | tr -d ' ')))
     [ "$SLOTS" -gt 0 ] || SLOTS=0
 
-    PINGED=0
-    if [ "$PING_CHECK" = "1" ] && [ -s "$WORK/good" ]; then
-        log "📶 Пинг $(wc -l < "$WORK/good" | tr -d ' ') серверов через $TEST_URL (до ${MAX_DELAY} мс)..."
-        if ping_outbounds "$WORK/good" "$WORK/alive"; then
-            ALIVE=$(wc -l < "$WORK/alive" | tr -d ' ')
-            ALIVE_REST=$(awk -F "$TAB" -v p="$PRIORITY_COUNT" '$1 > p' "$WORK/alive" | wc -l | tr -d ' ')
-            log "📶 Отвечают: $ALIVE из $(wc -l < "$WORK/good" | tr -d ' ')"
+    if [ "$PINGING" = "1" ]; then
+        cut -f1 "$WORK/selected" | while read -r id; do
+            grep -q "^$id$TAB" "$WORK/alive" || \
+                log "⚠️  Прямой ключ не отвечает, но оставлен: $(link_title "$(sed -n "${id}p" "$WORK/candidates")")"
+        done
 
-            cut -f1 "$WORK/selected" | while read -r id; do
-                grep -q "^$id$TAB" "$WORK/alive" || \
-                    log "⚠️  Прямой ключ не отвечает, но оставлен: $(link_title "$(sed -n "${id}p" "$WORK/candidates")")"
-            done
-
-            if [ "$ALIVE_REST" -gt 0 ]; then
-                # id живых по возрастанию задержки -> их outbound'ы
-                awk -F "$TAB" -v p="$PRIORITY_COUNT" '$1 > p' "$WORK/alive" | sort -t "$TAB" -k2,2n | \
-                    head -n "$SLOTS" | cut -f1 | while read -r id; do
-                        grep "^$id$TAB" "$WORK/rest"
-                    done >> "$WORK/selected"
-                PINGED=1
-            else
-                log "⚠️  Ни один сервер из подписок не ответил — беру проверенные без учёта пинга"
-            fi
-        else
-            log "⚠️  Не удалось запустить пинг — беру проверенные без учёта пинга"
+        if [ -s "$WORK/rest" ] && ! awk -F "$TAB" -v p="$PRIORITY_COUNT" '$1 > p {f=1} END {exit !f}' "$WORK/alive"; then
+            # Скорее всего, нет интернета или подписки целиком мёртвые
+            log "❌ Ни один сервер из подписок не ответил за ${MAX_DELAY} мс — ничего не меняем"
+            exit 1
         fi
+
+        # id живых по возрастанию задержки -> их outbound'ы
+        awk -F "$TAB" -v p="$PRIORITY_COUNT" '$1 > p' "$WORK/alive" | sort -t "$TAB" -k2,2n | \
+            head -n "$SLOTS" | cut -f1 | while read -r id; do
+                grep "^$id$TAB" "$WORK/rest"
+            done >> "$WORK/selected"
+    else
+        head -n "$SLOTS" "$WORK/rest" >> "$WORK/selected"
     fi
-    [ "$PINGED" = "1" ] || head -n "$SLOTS" "$WORK/rest" >> "$WORK/selected"
 
     # Финальная проверка всего набора вместе
     if [ -s "$WORK/selected" ] && ! check_outbounds "$WORK/selected"; then
