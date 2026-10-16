@@ -8,7 +8,6 @@
 - 🌐 Парсинг HTML/текстовых страниц с ключами
 - 🔗 Поддержка прямых ссылок (vless://, ss://, trojan:// и др.)
 - ⭐ Приоритизация прямых ключей (всегда попадают в конфиг)
-- 🎲 Случайная выборка серверов до установленного лимита
 - 📶 Пинг через временный sing-box: в Podkop попадают `LIMIT` самых быстрых живых серверов из всех подписок
 - 🧪 Проверка каждого ключа кодом самого Podkop и установленным `sing-box check`: битые ключи отсеиваются до записи в конфиг
 - ✂️ Быстрый поиск битых ключей делением пополам (чистый набор — одна проверка)
@@ -92,29 +91,6 @@ sed -i '/podkop-update/d' /etc/crontabs/root && \
 - Доступ к интернету
 - Podkop установлен
 - Podkop 0.7.14 или новее (проверено на 0.7.14–0.7.24)
-
-## 🧪 Песочница (проверка без роутера)
-`tests/sandbox.sh` гоняет скрипт и подписки на компьютере. Он скачивает настоящие библиотеки Podkop нужной версии и sing-box, а `uci`, `wget`, `pidof` и рестарт Podkop подменяет заглушками. «Рестарт» собирает конфиг кодом Podkop и делает `sing-box check`, поэтому битый ключ роняет его так же, как настоящий Podkop.
-
-```bash
-# какие ключи в подписке битые и почему
-tests/sandbox.sh links https://example.com/sub.txt
-
-# скормить Podkop всю подписку без фильтра — упадёт ли он
-tests/sandbox.sh podkop https://example.com/sub.txt
-
-# прогнать update.sh целиком (до 3 источников; можно локальные файлы)
-tests/sandbox.sh run https://example.com/sub.txt
-
-# проверить откат: первый рестарт «падает»
-BREAK_RESTART=1 SEED_LINKS=tests/fixtures/links.txt tests/sandbox.sh run https://example.com/sub.txt
-```
-
-Версии задаются через `PODKOP_VERSION=0.7.22` и `SINGBOX_VERSION=v1.13.0`, свой бинарник (например, podkop-engine) — через `SINGBOX_BIN`. Ближе всего к роутеру запуск под busybox ash в alpine:
-```bash
-docker run --rm -v "$PWD":/w -w /w -e SANDBOX_CACHE=/tmp/sb alpine:3.20 sh -c 'apk add -q curl jq && tests/sandbox.sh run https://example.com/sub.txt'
-```
-Нужны `curl` и `jq`.
 
 ## 📌 Примечания
 - Пинг отбирает живые серверы на момент запуска, а дальше между ними переключается сам Podkop (URLTest)
