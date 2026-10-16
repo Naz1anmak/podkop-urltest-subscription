@@ -125,19 +125,32 @@ EOF
 # wget через curl; локальный файл отдаётся как есть, чтобы run принимал фикстуры
 cat > "$BIN/wget" <<'EOF'
 #!/bin/sh
-ua=""; url=""
-for a in "$@"; do
-    case "$a" in
-        --user-agent=*) ua="${a#--user-agent=}" ;;
+ua=""; url=""; out="-"; timeout=30
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --user-agent=*) ua="${1#--user-agent=}" ;;
+        -qO-|-O-) out="-" ;;
+        -O) out="$2"; shift ;;
+        -T) timeout="$2"; shift ;;
         -*) ;;
-        *) url="$a" ;;
+        *) url="$1" ;;
     esac
+    shift
 done
-if [ -f "$url" ]; then cat "$url"; else curl -fsSL -A "$ua" "$url"; fi
+if [ -f "$url" ]; then
+    data=$(cat "$url")
+else
+    data=$(curl -fsSL -m "$timeout" -A "$ua" "$url") || exit 1
+fi
+if [ "$out" = "-" ]; then printf '%s' "$data"; else printf '%s' "$data" > "$out"; fi
 EOF
 
-# sleep: не ждём по-настоящему
-printf '#!/bin/sh\nexit 0\n' > "$BIN/sleep"
+# sleep: долгие ожидания пропускаем, короткие (опрос API пинга) — настоящие
+cat > "$BIN/sleep" <<'EOF'
+#!/bin/sh
+[ "$1" -le 1 ] 2>/dev/null && exec /bin/sleep "$1"
+exit 0
+EOF
 
 # Рестарт Podkop: собрать outbound'ы кодом Podkop и проверить как при старте
 cat > "$BIN/podkop-restart" <<EOF
@@ -174,14 +187,14 @@ echo "🧪 Podkop $PODKOP_VERSION, $("$SB" version | head -n 1)" >&2
 
 # Достаёт ключи из url/файла через функции самого update.sh
 extract_links() {
-    sed -n '/^clean_name()/,/^# --- СБОР ---/p' "$ROOT/update.sh" > "$RUN/funcs.sh"
+    sed -n '/^find_links()/,/^}/p; /^clean_name()/,/^# --- СБОР ---/p' "$ROOT/update.sh" > "$RUN/funcs.sh"
     # shellcheck disable=SC1091
     . "$RUN/funcs.sh"
     PATTERN=$(sed -n "s/^PATTERN=//p" "$ROOT/update.sh")
     eval "PATTERN=$PATTERN"
     for src in "$@"; do
         if [ -f "$src" ]; then cat "$src"; else download_content "$src"; fi
-    done | grep -oE "$PATTERN" | awk '!seen[$0]++'
+    done | find_links | awk '!seen[$0]++'
 }
 
 mode="${1:-}"
